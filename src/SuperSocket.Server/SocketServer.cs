@@ -1,13 +1,17 @@
 using System;
+using System.Linq;
+using System.Net.Sockets;
+using System.Threading.Tasks;
+using System.Threading;
+using System.Collections.Generic;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
-using System.Linq;
 using SuperSocket.Config;
-using System.Net.Sockets;
-using System.Threading.Tasks;
-using System.Threading;
+using SuperSocket.Channel;
+using System.IO.Pipelines;
+using SuperSocket.ProtoBase;
 
 namespace SuperSocket.Server
 {
@@ -18,6 +22,20 @@ namespace SuperSocket.Server
         private IServiceProvider _serviceProvider;
 
         public ServerConfig Config { get; private set; }
+
+        private long _sessionCount;
+
+        /// <summary>
+        /// Total session count
+        /// </summary>
+        /// <returns>total session count</returns>
+        public long SessionCount
+        {
+            get
+            {
+                return _sessionCount;
+            }
+        }
 
         private CancellationTokenSource _cancellationTokenSource = new CancellationTokenSource();
 
@@ -32,23 +50,27 @@ namespace SuperSocket.Server
 
         public Listener[] Listeners { get; private set; }
 
+        private IList<IPipeConnectionListener> _socketListeners;
+
         protected internal ILoggerFactory LoggerFactory { get; private set; }
+
+        private ILogger _logger;
 
         private bool _initialized = false;
 
-        public bool Configure(IConfiguration config)
-        {
-            var services = new ServiceCollection();
-            return Configure(services, config);
-        }
-
-        public bool Configure(IServiceCollection services, IConfiguration config)
+        private IAppSessionFactory _appSessionFactory;
+        
+        public bool Configure<TPackageInfo, TPipelineFilter>(IConfiguration config, IServiceCollection services = null, Action<IAppSession, TPackageInfo> packageHandler = null)
+            where TPackageInfo : class
+            where TPipelineFilter : IPipelineFilter<TPackageInfo>, new()
         {
             if (services == null)
-                throw new ArgumentNullException(nameof(services));
+            {
+                services = new ServiceCollection();
+            }
 
             if (config == null)
-                throw new ArgumentNullException(nameof(config));
+                throw new ArgumentNullException(nameof(config));            
             
             // prepare service collections
             _serviceCollection = services.AddOptions() // activate options
@@ -73,7 +95,11 @@ namespace SuperSocket.Server
                     .GetService<ILoggerFactory>()
                     .AddConsole(LogLevel.Debug);
 
+            _logger = LoggerFactory.CreateLogger("SocketServer");
+
             ConfigureListeners(Config);
+
+            _appSessionFactory = new AppSessionFactory<TPackageInfo, TPipelineFilter>(packageHandler);
 
             return _initialized = true;
         }
@@ -89,32 +115,69 @@ namespace SuperSocket.Server
         {
             if (!_initialized)
                 throw new Exception("The server has not been initialized successfully!");
+
+            var listenSockets = _socketListeners = new List<IPipeConnectionListener>(Listeners.Length);
             
-            Listeners.Select(l => Task.Run(() => AcceptClients(l)));
+            foreach (var listener in Listeners)
+            {
+                var listenSocket = _serviceProvider.GetService<IPipeConnectionListener>();
+
+                try
+                {
+                    listenSocket.Start(listener.EndPoint, HandleNewClient);
+                    _logger.LogDebug($"Listen the endpoint {listener.EndPoint} suceeded.");
+                }
+                catch (Exception e)
+                {
+                    _logger.LogError($"Listen the endpoint {listener.EndPoint} failed.", e);
+                    continue;
+                }
+                
+                listenSockets.Add(listenSocket);
+            }
+
+            if (!listenSockets.Any())
+            {
+                _logger.LogError($"No listener was started!");
+                return false;
+            }
 
             return true;
         }
 
-        private async void AcceptClients(Listener listener)
+        private Task HandleNewClient(IPipeConnection connection)
         {
-            var socketListener = new SocketListener(listener);
+            Interlocked.Increment(ref _sessionCount);
+            var session = _appSessionFactory.Create(connection);
+            session.Closed += OnSessionClosed;
+            Task.Run(async () =>  await ProcessRequest(session));
+            return Task.CompletedTask;
+        }
 
-            var token = _cancellationTokenSource.Token;
-            
-            while (!token.IsCancellationRequested)
-            {
-                var socket = await socketListener.AcceptAsync();
+        private async Task ProcessRequest(IAppSession session)
+        {
+            await session.ProcessRequest();
+        }
 
-                
-
-                if (token.IsCancellationRequested)
-                    break;
-            }
+        private void OnSessionClosed(object sender, EventArgs e)
+        {
+            Interlocked.Decrement(ref _sessionCount);
         }
 
         public void Stop()
         {
+            _logger.LogDebug("The server is stopping...");
             _cancellationTokenSource.Cancel();
+
+            _logger.LogDebug("Waiting for all listeners to stop...");
+
+            foreach (var l in _socketListeners)
+            {
+                l.Stop();
+            }
+
+            _logger.LogDebug("All listeners have stoppped.");
+            _logger.LogDebug("The server stopped.");
         }
     }
 }
